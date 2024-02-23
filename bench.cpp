@@ -7,6 +7,8 @@
 #include <cstring>
 #include <fstream>
 
+#include <trantor/net/EventLoopThreadPool.h>
+
 template <typename T, typename U>
 void fill_random(std::span<T> data, U min, U max)
 {
@@ -152,6 +154,10 @@ struct RKNNMatMul
 
 int main()
 {
+    constexpr size_t num_threads = 3;
+    static_assert(num_threads <= 3); // Only 3 NPU cores on RK3588
+    trantor::EventLoopThreadPool pool(num_threads);
+    pool.start();
 
     size_t run_count = 30;
     std::vector<int> m = {1, 2, 4, 8, 16, 32, 64, 128};
@@ -171,8 +177,8 @@ int main()
         std::cerr << "Failed to open init.csv" << std::endl;
         return 1;
     }
-    file << "count,m,k,n,type,ac_native,b_native,time_ns,gops\n";
-    initfile << "m,k,n,type,ac_native,b_native,time_ns\n";
+    file << "count,m,k,n,type,ac_native,b_native,time_ns,gops,threads\n";
+    initfile << "m,k,n,type,ac_native,b_native,time_ns,threads\n";
     for(auto m_ : m)
     {
         for(auto k_ : k)
@@ -202,23 +208,51 @@ int main()
                                 t = RKNN_INT4_MM_INT4_TO_INT16;
                                 type_str = "RKNN_INT4_MM_INT4_TO_INT16";
                             }
+
+                            std::vector<std::shared_ptr<RKNNMatMul>> matmuls;
+                            std::vector<std::promise<void>> promises;
+                            promises.resize(num_threads);
+                            matmuls.resize(num_threads);
+
                             auto start = std::chrono::high_resolution_clock::now();
-                            RKNNMatMul matmul(m_, k_, n_, t, ac_native, b_native);
+                            for(size_t i = 0; i < num_threads; i++)
+                            {
+                                pool.getLoop(i)->queueInLoop([&, i]() {
+                                    matmuls[i] = std::make_shared<RKNNMatMul>(m_, k_, n_, t, ac_native, b_native);
+                                    promises[i].set_value();
+                                });
+                            }
+                            for(auto &p : promises)
+                            {
+                                p.get_future().get();
+                            }
                             auto end = std::chrono::high_resolution_clock::now();
                             auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
-                            initfile << m_ << "," << k_ << "," << n_ << "," << type_str << "," << ac_native << "," << b_native << "," << duration.count() << "\n";
-                            std::cout << "INIT m: " << m_ << ", k: " << k_ << ", n: " << n_ << ", type: " << type_str << ", ac_native: " << ac_native << ", b_native: " << b_native << ", init time: " << duration.count() << "ns" << "\n";
+                            initfile << m_ << "," << k_ << "," << n_ << "," << type_str << "," << ac_native << "," << b_native << "," << duration.count() << ", " << num_threads << "\n";
+                            std::cout << "INIT m: " << m_ << ", k: " << k_ << ", n: " << n_ << ", type: " << type_str << ", ac_native: " << ac_native << ", b_native: " << b_native << ", init time: " << duration.count() << "ns " << num_threads << " threads\n";
 
                             for(size_t i = 0; i < run_count; i++)
                             {
+                                std::vector<std::promise<void>> promises(num_threads);
                                 auto start = std::chrono::high_resolution_clock::now();
-                                matmul.run();
+                                for(size_t j = 0; j < num_threads; j++)
+                                {
+                                    auto &prom = promises[j];
+                                    pool.getLoop(j)->runInLoop([&, i, j]() mutable {
+                                        matmuls[j]->run();
+                                        prom.set_value();
+                                    });
+                                }
+                                for(auto &p : promises)
+                                {
+                                    p.get_future().get();
+                                }
                                 auto end = std::chrono::high_resolution_clock::now();
                                 auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
                                 auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
                                 auto gops = (uint64_t)m_ * n_ * (2 * k_ - 1) / 1000UL / ((double)duration_us.count());
-                                file << i << "," << m_ << "," << k_ << "," << n_ << "," << type_str << "," << ac_native << "," << b_native << "," << duration.count() << "," << gops << "\n";
-                                std::cout << "m: " << m_ << ", k: " << k_ << ", n: " << n_ << ", type: " << type_str << ", ac_native: " << ac_native << ", b_native: " << b_native << ", time: " << duration.count() << "ns, " << gops << "GOPS" << "\n";
+                                file << i << "," << m_ << "," << k_ << "," << n_ << "," << type_str << "," << ac_native << "," << b_native << "," << duration.count() << "," << gops << "," << num_threads << "\n";
+                                std::cout << "m: " << m_ << ", k: " << k_ << ", n: " << n_ << ", type: " << type_str << ", ac_native: " << ac_native << ", b_native: " << b_native << ", time: " << duration.count() << "ns, " << gops*num_threads << "GOPS, threads: " << num_threads << "\n";
                             }
                         }
                     }
@@ -226,4 +260,7 @@ int main()
             }
         }
     }
+
+    file.close();
+    initfile.close();
 }
